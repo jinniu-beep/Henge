@@ -124,6 +124,9 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
+    /* The guest's metallibs and their functions: how many iPadOS 17 below had to be claimed as iOS, how many of those
+       Metal then loaded, and how many function lookups still came back empty (all zero on a healthy OS). */
+    uint32_t libs_patched, libs_loaded, funcs_ok, funcs_nil;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
@@ -387,6 +390,64 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     return stand_in;
 }
 
+/* A metallib's header, as MetalLibraryArchive reads it (github.com/YuAo/MetalLibraryArchive): "MTLB" at 0, the target
+   platform at 4 (0x8001 macOS, 0x0001 iOS), the format's version at 6, the type at 10, the target OS at 11 (0x81 macOS,
+   0x82 iOS) and the target OS's version at 12 and 14. The guest's macOS compiles its GPU code for macOS, and iPadOS 17's
+   Metal refuses such a library outright ("This library format is not supported on this platform (or was built with an old
+   version of the tools)"): every function comes back nil, so every pipeline is dropped and nothing is ever drawn. Claiming
+   this OS in those three fields costs one copy of the library and nothing else changes: the offsets, sizes and hashes in
+   the header still describe the same bytes. Whether Metal then accepts the bitcode is a separate question, and the two
+   outcomes are logged apart. iPadOS 18 loads these libraries as they are, so the patch is only tried below it;
+   HV_PVG_METALLIB_IOS=0 turns it off anywhere and =1 turns it on everywhere. */
+static int hv_metallib_claim_ios(NSMutableData *lib, BOOL say) { /* -1: not a metallib, 0: already iOS, 1: patched */
+    const uint8_t *p = lib.bytes;
+    static int shown; /* the first few headers in full, then the counters in the stats line say the rest */
+    if (say) say = shown++ < 8;
+    if (lib.length < 88 || memcmp(p, "MTLB", 4)) {
+        if (say) fprintf(stderr, "hengevm: pvg-metal: metallib header: not a metallib (%lu bytes), not patched\n", (unsigned long)lib.length);
+        return -1;
+    }
+    uint16_t platform, fmaj, fmin, omaj, omin;
+    uint64_t bc_off, bc_len;
+    memcpy(&platform, p + 4, 2), memcpy(&fmaj, p + 6, 2), memcpy(&fmin, p + 8, 2);
+    memcpy(&omaj, p + 12, 2), memcpy(&omin, p + 14, 2);
+    memcpy(&bc_off, p + 72, 8), memcpy(&bc_len, p + 80, 8);
+    if (say) fprintf(stderr, "hengevm: pvg-metal: metallib header: platform %#06x, format %u.%u, target OS %#04x %u.%u, %lu bytes\n",
+                     platform, fmaj, fmin, p[11], omaj, omin, (unsigned long)lib.length);
+    if (say) { /* The bitcode names its own target ("air64-apple-macosx15.6.0"), which is what Metal compiles. It is a length-
+                  prefixed string inside the bitcode, so it cannot be edited to a shorter one in place: this only says what
+                  it is, so a log tells whether a library that loaded still names macOS. */
+        if (bc_len && bc_off + bc_len <= lib.length) {
+            const char *bc = (const char *)p + bc_off, *end = bc + bc_len;
+            for (const char *q = bc; q + 12 <= end; q++)
+                if (!memcmp(q, "air64-apple-", 12)) {
+                    size_t n = 0;
+                    while (q + n < end && n < 63 && q[n] >= 0x20 && q[n] < 0x7f) n++;
+                    fprintf(stderr, "hengevm: pvg-metal: metallib header: bitcode triple %.*s\n", (int)n, q);
+                    break;
+                }
+        }
+    }
+    if (platform == 0x0001 && p[11] == 0x82) {
+        if (say) fprintf(stderr, "hengevm: pvg-metal: metallib header: already claims iOS, format %u.%u left as it is\n", fmaj, fmin);
+        return 0; /* nothing to claim: the ladder's format attempts still follow */
+    }
+    uint8_t *w = lib.mutableBytes;
+    uint16_t ios = 0x0001, v17 = 17, v0 = 0;
+    memcpy(w + 4, &ios, 2);   /* iOS, not macOS */
+    w[11] = 0x82;             /* the target OS too: 0x81 is macOS */
+    memcpy(w + 12, &v17, 2);  /* the oldest this app runs on, which any newer OS accepts */
+    memcpy(w + 14, &v0, 2);
+    if (say) fprintf(stderr, "hengevm: pvg-metal: metallib header: patched to platform 0x0001, target OS 0x82 17.0\n");
+    return 1;
+}
+
+/* Claims another version of the library FORMAT (bytes 6 and 8, the guest's macOS 15.6 sends 2.8). MetalLibraryArchive
+   reads every such header the same way, from 2.2 up, so this only changes what the header says. */
+static void hv_metallib_set_format(uint8_t *w, uint16_t major, uint16_t minor) {
+    memcpy(w + 6, &major, 2), memcpy(w + 8, &minor, 2);
+}
+
 - (id)makeFunction:(uint64_t)at task:(uint32_t)task {
     if (getenv("HV_PVG_FAIL_LIBS")) { /* testing: every library refused, as an OS that cannot load them does */
         [self complain:@"library: refused (HV_PVG_FAIL_LIBS)"];
@@ -401,7 +462,60 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     id<MTLLibrary> library = [device newLibraryWithData:data error:&err];
     if (!library) {
         [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
-        return nil;
+        BOOL try_patch = YES;
+#if TARGET_OS_IPHONE
+        if (@available(iOS 18.0, *)) try_patch = NO; /* those load these libraries as they are */
+#endif
+        if (getenv("HV_PVG_METALLIB_IOS")) try_patch = atoi(getenv("HV_PVG_METALLIB_IOS")) != 0; /* =1 forces it on, =0 off anywhere */
+        if (!try_patch) {
+            [self complain:@"library: header patch not tried (iOS 18 or newer, or HV_PVG_METALLIB_IOS=0)"];
+            return nil;
+        }
+        /* Claiming iOS first; if Metal still refuses, claim an older library format too, newest first. The guest's macOS
+           15.6 sends 2.8, and iPadOS 17.6's Metal was built with tools from before that: "or was built with an old
+           version of the tools" may be about this number rather than the code. Each attempt is a fresh copy of the
+           guest's own bytes, so nothing a refusal does carries into the next one. HV_PVG_METALLIB_FORMAT=major.minor
+           pins one instead of the ladder (0 keeps the library's own). */
+        static const uint16_t ladder[][2] = {{0, 0}, {2, 7}, {2, 6}, {2, 5}};
+        const int ladder_count = (int)(sizeof ladder / sizeof ladder[0]);
+        const char *want = getenv("HV_PVG_METALLIB_FORMAT");
+        uint16_t pinned[2] = {0, 0};
+        BOOL pinned_set = want && atof(want) > 0;
+        if (pinned_set) pinned[0] = (uint16_t)atof(want), pinned[1] = (uint16_t)(atof(want) * 10.0 + 0.5) % 10;
+        {   /* the header is read once, from a copy made just to look at it */
+            NSMutableData *probe = [lib mutableCopy];
+            int claim = hv_metallib_claim_ios(probe, YES);
+            if (claim < 0) {
+                [self complain:@"library: header patch did not apply (see the metallib header line above)"];
+                return nil;
+            }
+            if (claim > 0) libs_patched++;
+            /* ladder[0] leaves the format alone, which is the attempt to make first when the claim changed something;
+               a library that already claimed iOS would only be offered its own bytes again, so it starts at 1. */
+            int first = (claim == 0 && !pinned_set) ? 1 : 0, last = pinned_set ? 0 : ladder_count - 1;
+            for (int i = first; i <= last; i++) {
+                NSMutableData *patched = [lib mutableCopy]; /* kept whole: dispatch data does not own its bytes */
+                hv_metallib_claim_ios(patched, NO);         /* said above */
+                uint16_t f[2] = {pinned_set ? pinned[0] : ladder[i][0], pinned_set ? pinned[1] : ladder[i][1]};
+                if (f[0]) {
+                    hv_metallib_set_format(patched.mutableBytes, f[0], f[1]);
+                    [self complain:[NSString stringWithFormat:@"library: claiming format %u.%u as well", f[0], f[1]]];
+                }
+                NSString *how = f[0] ? [NSString stringWithFormat:@" and format %u.%u", f[0], f[1]] : @"";
+                NSError *err2 = nil;
+                dispatch_data_t data2 = dispatch_data_create(patched.bytes, patched.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                id<MTLLibrary> retry = [device newLibraryWithData:data2 error:&err2];
+                if (retry) {
+                    [self complain:[NSString stringWithFormat:@"library: header patched to iOS%@, loaded (%lu functions)", how, (unsigned long)retry.functionNames.count]];
+                    libs_loaded++;
+                    library = retry; /* lib stays the guest's own bytes, for the shader dump below */
+                    break;
+                }
+                if (i == last) /* the whole ladder: one line saying how far it got */
+                    [self complain:[NSString stringWithFormat:@"library: header patched to iOS%@, still refused: %@", how, err2.localizedDescription]];
+            }
+        }
+        if (!library) return nil;
     }
     {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
         const char *tf = getenv("HV_PVG_TRACE_FILE");
@@ -412,7 +526,13 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
             [lib writeToFile:[dir stringByAppendingPathComponent:name] atomically:NO];
         }
     }
-    return [library newFunctionWithName:library.functionNames.firstObject];
+    id function = [library newFunctionWithName:library.functionNames.firstObject];
+    if (function) funcs_ok++;
+    else { /* the library loaded but its function did not: a pipeline over it will come back nil */
+        funcs_nil++;
+        if (funcs_nil == 1) [self complain:[NSString stringWithFormat:@"function %@: not found in a library that loaded", library.functionNames.firstObject ?: @"(unnamed)"]];
+    }
+    return function;
 }
 
 - (id)makeSerialized:(uint64_t)at length:(uint32_t)size task:(uint32_t)task {
@@ -1877,7 +1997,7 @@ typedef struct {
     if (++execs % 2000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
-        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
+        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s; libraries %u patched, %u loaded; functions %u found, %u not\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time, libs_patched, libs_loaded, funcs_ok, funcs_nil);
         encode_time = gpu_wait_time = 0;
     }
     return YES;

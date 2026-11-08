@@ -1,0 +1,145 @@
+# .github/workflows/build-henge.yml
+#
+# Builds Henge.ipa from this fork on a GitHub-hosted macOS runner, no Mac needed.
+# Free on a PUBLIC repo: public repos get unlimited minutes on hosted runners,
+# including macOS. On a private repo, macOS minutes bill at 10x, so the free
+# tier's ~2000 min/month is only ~200 macOS minutes.
+#
+# The IPA comes out unsigned with ad-hoc signing (package_ipa.sh's normal
+# output). SideStore/AltStore re-signs it with your certificate on install
+# and keeps the entitlements it can; increased-memory-limit only survives if
+# your certificate carries it, and Henge falls back to file-backed guest RAM
+# without it.
+
+name: Build Henge IPA
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, fix-ipados17-black-display]
+
+env:
+  HUSK: ${{ github.workspace }}/Husk
+  # The Makefile takes its slirp headers from IOS_DEPS, not HUSK:
+  #   IOS_DEPS ?= $(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot
+  # (HUSK is only read by ios/scripts/fetch_deps.sh.)
+  IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
+  # The Husk revision ci/build-bitrise.sh pins, so this build matches the release.
+  HUSK_REV: afe83d45b31194c4cc9f7b3db7ec2c757db8346e
+
+jobs:
+  build:
+    # Xcode 27 runner (arm64). Plain `xcode-27` is a standard runner, so it is
+    # free on public repos; `xcode-27-xlarge` is a paid larger runner.
+    # Table: https://github.com/actions/runner-images#available-images
+    runs-on: xcode-27
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out Henge (this fork)
+        uses: actions/checkout@v4
+        with:
+          path: Henge
+
+      # fetch_deps.sh copies prebuilt pieces out of a BUILT Husk checkout:
+      # StikJIT.xcframework (vendored in Husk's repo, comes with checkout),
+      # libhusk_rppairing.a (scripts/build_rppairing_ios.sh) and the
+      # libslirp/glib/intl/pcre2 static libs (scripts/build_ios.sh).
+      - name: Check out Husk
+        uses: actions/checkout@v4
+        with:
+          repository: Leviidev/Husk
+          ref: ${{ env.HUSK_REV }}
+          path: Husk
+
+      - name: Cache Husk's sources and prebuilt iOS pieces
+        uses: actions/cache@v4
+        with:
+          path: |
+            Husk/third_party/build
+            Husk/build
+          key: husk-ios-arm64-${{ env.HUSK_REV }}-${{ hashFiles('Husk/scripts/build_ios.sh', 'Husk/scripts/fetch_sources.sh') }}
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          brew install xcodegen meson ninja pkg-config
+          # Runner images ship rustup; add the iOS target if it's missing.
+          rustup target add aarch64-apple-ios || {
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            rustup target add aarch64-apple-ios
+          }
+
+      # build_ios.sh builds from third_party/build/<name>; the sources are
+      # fetched by fetch_sources.sh, which Husk's own ci_build.sh runs first.
+      - name: Fetch Husk's third-party sources
+        working-directory: Husk
+        run: bash scripts/fetch_sources.sh
+
+      # Henge only needs these three sysroot pieces: libffi (a glib dep),
+      # glib (whose meson subprojects also produce libpcre2-8 and libintl),
+      # and libslirp (the guest network). Skip Husk's pixman/libucontext/qemu
+      # stages entirely: that's the Android emulator, minutes instead of an
+      # hour-plus.
+      - name: Build the iOS libraries Henge needs
+        working-directory: Husk
+        run: bash scripts/build_ios.sh libffi glib libslirp
+
+      - name: Build Husk's on-device pairing library
+        working-directory: Husk
+        run: bash scripts/build_rppairing_ios.sh
+
+      - name: Copy prebuilt deps into Henge
+        working-directory: Henge
+        run: zsh ios/scripts/fetch_deps.sh
+
+      # Husk ships unmodified StikJIT 1.9.0, whose debugserver packets use nine
+      # hex digits and so truncate JIT mappings above 0xfffffffff on iPads.
+      # ci/build-stikjit.sh rebuilds it with the wider packet format (as
+      # ci/build-bitrise.sh does); its build products replace the ones just
+      # copied in from Husk.
+      - name: Rebuild StikJIT with full-width debugserver addresses
+        working-directory: Henge
+        run: bash ci/build-stikjit.sh "${{ github.workspace }}/StikJIT"
+
+      - name: Use the rebuilt StikJIT
+        working-directory: Henge
+        run: |
+          set -euxo pipefail
+          rm -rf ios/deps/StikJIT.xcframework
+          ditto "${{ github.workspace }}/StikJIT/StikJIT.xcframework" ios/deps/StikJIT.xcframework
+
+      - name: Build the restore stack (libirecovery, usbmuxd, idevicerestore)
+        working-directory: Henge
+        run: zsh tools/build_ios_restore.sh
+
+      - name: Build the engine
+        working-directory: Henge
+        run: make ios-lib
+
+      - name: Package Henge.ipa
+        working-directory: Henge
+        run: zsh ios/scripts/package_ipa.sh
+
+      - name: Show what was built
+        if: always()
+        run: |
+          ls -la "$HOME/Desktop" || true
+          du -h "$HOME/Desktop/Henge.ipa" 2>/dev/null || true
+
+      - name: Upload Henge.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-ipa-${{ github.sha }}
+          path: /Users/runner/Desktop/Henge.ipa
+          if-no-files-found: error
+
+      - name: Upload the build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.sha }}
+          path: |
+            Henge/ios/build/DerivedData.buildlog
+            /Users/runner/Library/Logs
+          if-no-files-found: ignore
