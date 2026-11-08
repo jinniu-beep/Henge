@@ -126,7 +126,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
     /* The guest's metallibs and their functions: how many iPadOS 17 below had to be claimed as iOS, how many of those
        Metal then loaded, and how many function lookups still came back empty (all zero on a healthy OS). */
-    uint32_t libs_patched, libs_loaded, funcs_ok, funcs_nil;
+    uint32_t libs_patched, libs_loaded, funcs_ok, funcs_nil, versions_lowered;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
@@ -448,6 +448,51 @@ static void hv_metallib_set_format(uint8_t *w, uint16_t major, uint16_t minor) {
     memcpy(w + 6, &major, 2), memcpy(w + 8, &minor, 2);
 }
 
+/* The versions each function declares, lowered to what this OS's Metal takes. Every function's entry in the function
+   list has a VERS tag of four UInt16: air major, air minor, language major, language minor. macOS 15.6's tools wrote
+   air 2.7 and language 3.2; iPadOS 17.6's Metal stops at the versions Xcode 15 wrote, air 2.6 and language 3.1, and
+   says so when the pipeline is built ("Function X has a deployment target (0x00020007) which is incompatible with this
+   OS (0x00020006)", "Function Y is using language version 3.2"). Only the bitcode is hashed, by the HASH tag, so these
+   numbers can be lowered in place. HV_PVG_METALLIB_VERS=minor,minor names others (0 keeps each library's own). */
+static uint32_t hv_metallib_clamp_versions(NSMutableData *lib, BOOL say) {
+    uint8_t *p = lib.mutableBytes;
+    if (lib.length < 40 || memcmp(p, "MTLB", 4)) return 0;
+    uint64_t fl_off, fl_len;
+    memcpy(&fl_off, p + 24, 8), memcpy(&fl_len, p + 32, 8);
+    if (!fl_off || !fl_len || fl_off + fl_len > lib.length) return 0;
+    uint16_t max_air = 6, max_lang = 1; /* iPadOS 17.6's ceiling, in the old Xcode 15 tools' numbers */
+    const char *e = getenv("HV_PVG_METALLIB_VERS");
+    if (e) { int a = atoi(e), l = atoi(strchr(e, ',') ? strchr(e, ',') + 1 : "0"); if (a > 0) max_air = (uint16_t)a; max_lang = (uint16_t)l; }
+    uint64_t end = fl_off + fl_len, at = fl_off + 4;
+    uint32_t count = 0, changed = 0;
+    memcpy(&count, p + fl_off, 4);
+    for (uint32_t i = 0; i < count && at + 8 <= end; i++) {
+        at += 4; /* the group's own size, then its tags */
+        while (at + 6 <= end) {
+            char name[5] = {0};
+            memcpy(name, p + at, 4);
+            if (!memcmp(name, "ENDT", 4)) { at += 4; break; }
+            uint16_t n = 0;
+            memcpy(&n, p + at + 4, 2);
+            uint64_t content = at + 6, next = content + n;
+            if (next > end) { at = end; break; }
+            if (!memcmp(name, "VERS", 4) && n >= 8) {
+                uint16_t v[4];
+                memcpy(v, p + content, 8);
+                uint16_t air = (v[0] == 2 && v[1] > max_air) ? max_air : v[1];
+                uint16_t lang = (v[2] == 3 && v[3] > max_lang) ? max_lang : v[3];
+                if (air != v[1] || lang != v[3]) {
+                    memcpy(p + content + 2, &air, 2), memcpy(p + content + 6, &lang, 2), changed++;
+                    if (say) fprintf(stderr, "hengevm: pvg-metal: metallib versions: air %u.%u -> %u.%u, language %u.%u -> %u.%u\n",
+                                     v[0], v[1], v[0], air, v[2], v[3], v[2], lang);
+                }
+            }
+            at = next;
+        }
+    }
+    return changed;
+}
+
 - (id)makeFunction:(uint64_t)at task:(uint32_t)task {
     if (getenv("HV_PVG_FAIL_LIBS")) { /* testing: every library refused, as an OS that cannot load them does */
         [self complain:@"library: refused (HV_PVG_FAIL_LIBS)"];
@@ -471,11 +516,12 @@ static void hv_metallib_set_format(uint8_t *w, uint16_t major, uint16_t minor) {
             [self complain:@"library: header patch not tried (iOS 18 or newer, or HV_PVG_METALLIB_IOS=0)"];
             return nil;
         }
-        /* Claiming iOS first; if Metal still refuses, claim an older library format too, newest first. The guest's macOS
-           15.6 sends 2.8, and iPadOS 17.6's Metal was built with tools from before that: "or was built with an old
-           version of the tools" may be about this number rather than the code. Each attempt is a fresh copy of the
-           guest's own bytes, so nothing a refusal does carries into the next one. HV_PVG_METALLIB_FORMAT=major.minor
-           pins one instead of the ladder (0 keeps the library's own). */
+        /* Claiming iOS is enough for the library to LOAD (the device's log shows "loaded (1 functions)" all the way),
+           but a pipeline over its functions is still refused: macOS 15.6's tools wrote air 2.7 and Metal language 3.2,
+           and iPadOS 17.6 stops at air 2.6 and 3.1 ("Function X has a deployment target (0x00020007) which is
+           incompatible with this OS (0x00020006)"). Those numbers sit in the function list's VERS tags, so they are
+           lowered here as well. Older library formats are still tried, as a last resort, if a load itself fails.
+           HV_PVG_METALLIB_FORMAT=major.minor pins a format instead of the ladder (0 keeps the library's own). */
         static const uint16_t ladder[][2] = {{0, 0}, {2, 7}, {2, 6}, {2, 5}};
         const int ladder_count = (int)(sizeof ladder / sizeof ladder[0]);
         const char *want = getenv("HV_PVG_METALLIB_FORMAT");
@@ -497,22 +543,26 @@ static void hv_metallib_set_format(uint8_t *w, uint16_t major, uint16_t minor) {
                 NSMutableData *patched = [lib mutableCopy]; /* kept whole: dispatch data does not own its bytes */
                 hv_metallib_claim_ios(patched, NO);         /* said above */
                 uint16_t f[2] = {pinned_set ? pinned[0] : ladder[i][0], pinned_set ? pinned[1] : ladder[i][1]};
-                if (f[0]) {
+                if (f[0]) { /* only a load that failed brings the ladder this far */
                     hv_metallib_set_format(patched.mutableBytes, f[0], f[1]);
                     [self complain:[NSString stringWithFormat:@"library: claiming format %u.%u as well", f[0], f[1]]];
                 }
+                uint32_t lowered = hv_metallib_clamp_versions(patched, i == first);
+                versions_lowered += lowered > 0;
                 NSString *how = f[0] ? [NSString stringWithFormat:@" and format %u.%u", f[0], f[1]] : @"";
                 NSError *err2 = nil;
                 dispatch_data_t data2 = dispatch_data_create(patched.bytes, patched.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
                 id<MTLLibrary> retry = [device newLibraryWithData:data2 error:&err2];
                 if (retry) {
-                    [self complain:[NSString stringWithFormat:@"library: header patched to iOS%@, loaded (%lu functions)", how, (unsigned long)retry.functionNames.count]];
+                    [self complain:[NSString stringWithFormat:@"library: patched to iOS%@%@, loaded (%lu functions)", how,
+                                    lowered ? [NSString stringWithFormat:@", %u function versions lowered", lowered] : @"",
+                                    (unsigned long)retry.functionNames.count]];
                     libs_loaded++;
                     library = retry; /* lib stays the guest's own bytes, for the shader dump below */
                     break;
                 }
                 if (i == last) /* the whole ladder: one line saying how far it got */
-                    [self complain:[NSString stringWithFormat:@"library: header patched to iOS%@, still refused: %@", how, err2.localizedDescription]];
+                    [self complain:[NSString stringWithFormat:@"library: patched to iOS%@, still refused: %@", how, err2.localizedDescription]];
             }
         }
         if (!library) return nil;
@@ -1997,7 +2047,7 @@ typedef struct {
     if (++execs % 2000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
-        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s; libraries %u patched, %u loaded; functions %u found, %u not\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time, libs_patched, libs_loaded, funcs_ok, funcs_nil);
+        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s; libraries %u patched, %u loaded; function versions lowered in %u; functions %u found, %u not\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time, libs_patched, libs_loaded, versions_lowered, funcs_ok, funcs_nil);
         encode_time = gpu_wait_time = 0;
     }
     return YES;
